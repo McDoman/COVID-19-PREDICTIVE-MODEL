@@ -1,0 +1,194 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Sep  6 03:59:25 2025
+
+@author: LAdedo
+"""
+import numpy as np
+import pandas as pd
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier, StackingClassifier
+from xgboost import XGBClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
+                             average_precision_score, classification_report, confusion_matrix,
+                             precision_score, recall_score)
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+DATA_PATH = "C:/Users/ladedo/Desktop/ArcGIS.file/ADEDO/EHA2/covid_ml_project/data/processed/clean.csv"
+TARGET = "result"
+
+df = pd.read_csv(DATA_PATH)
+label_map = {
+    "NEGATIVE": 0, "0": 0, "FALSE": 0,
+    "POSITIVE": 1, "1": 1, "TRUE": 1,
+    "PENDING": -1, "INDETERMINATE": -1, "UNKNOWN": -1
+}
+raw_labels = df[TARGET].astype(str).str.strip().str.upper()
+y = raw_labels.map(label_map)
+y = y.fillna(-1).astype(int)
+mask = y != -1
+X = df.loc[mask].drop(columns=[TARGET])
+y = y[mask]
+print(f"Final data shape: {X.shape}, labels: {y.shape}")
+print("Label distribution:\n", y.value_counts())
+
+# ==== 2. Split Data ====
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_trainval, y_trainval, test_size=0.2, stratify=y_trainval, random_state=42
+)
+
+# ==== 3. Preprocessing ====
+num_cols = X_train.select_dtypes(include=[float, int]).columns.tolist()
+cat_cols = [c for c in X_train.columns if c not in num_cols]
+num_pipe = Pipeline([
+    ("imp", SimpleImputer(strategy="median")),
+    ("sc", StandardScaler())
+])
+cat_pipe = Pipeline([
+    ("imp", SimpleImputer(strategy="most_frequent")),
+    ("ohe", OneHotEncoder(handle_unknown="ignore"))
+])
+pre = ColumnTransformer([
+    ("num", num_pipe, num_cols),
+    ("cat", cat_pipe, cat_cols)
+])
+
+# ==== 4. Base Learners ====
+lr = Pipeline([
+    ("pre", pre),
+    ("clf", LogisticRegression(max_iter=1000, class_weight="balanced"))
+])
+rf = Pipeline([
+    ("pre", pre),
+    ("clf", RandomForestClassifier(
+        n_estimators=500, max_depth=None, min_samples_split=2,
+        n_jobs=-1, class_weight="balanced_subsample", random_state=42
+    ))
+])
+pos = (y_train == 1).sum()
+neg = (y_train == 0).sum()
+scale_pos_weight = (neg / max(pos, 1))
+xgb = Pipeline([
+    ("pre", pre),
+    ("clf", XGBClassifier(
+        n_estimators=600, learning_rate=0.05, max_depth=4,
+        subsample=0.9, colsample_bytree=0.9,
+        eval_metric="aucpr",
+        n_jobs=-1, random_state=42,
+        scale_pos_weight=scale_pos_weight, tree_method="hist"
+    ))
+])
+
+# ==== 5. Voting Ensemble (Grid Search for PR-AUC) ====
+voter = VotingClassifier(
+    estimators=[("lr", lr), ("rf", rf), ("xgb", xgb)],
+    voting="soft",
+    weights=[1, 1, 1]
+)
+weight_grid = [
+    [1,1,1], [1,1,2], [1,2,1], [2,1,1],
+    [1,2,2], [2,1,2], [2,2,1], [1,1,3], [1,3,1], [3,1,1],
+    [1,2,3], [2,3,1], [3,1,2], [2,2,3], [3,2,2]
+]
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+grid = GridSearchCV(
+    estimator=voter,
+    param_grid={"weights": weight_grid},
+    scoring="average_precision",
+    cv=cv, n_jobs=-1, verbose=0
+)
+grid.fit(X_train, y_train)
+voter_best = grid.best_estimator_
+print("Best voting weights:", grid.best_params_, "CV AP:", grid.best_score_)
+
+# ==== 6. Stacking Ensemble ====
+stack = StackingClassifier(
+    estimators=[("lr", lr), ("rf", rf), ("xgb", xgb)],
+    final_estimator=LogisticRegression(max_iter=1000),
+    stack_method="predict_proba", 
+    passthrough=False,
+    cv=5, n_jobs=-1
+)
+stack.fit(X_train, y_train)
+
+# ==== 7. Compare Ensembles on Validation Set ====
+proba_voter_val = voter_best.predict_proba(X_val)[:, 1]
+ap_voter = average_precision_score(y_val, proba_voter_val)
+print("Voting AP (val):", ap_voter)
+
+proba_stack_val = stack.predict_proba(X_val)[:, 1]
+ap_stack = average_precision_score(y_val, proba_stack_val)
+print("Stacking AP (val):", ap_stack)
+
+best_ens = stack if ap_stack >= ap_voter else voter_best
+print("Selected:", "Stacking" if best_ens is stack else "Voting")
+
+# ==== 8. Calibrate on Validation Set ====
+best_ens.fit(X_train, y_train)
+calibrated = CalibratedClassifierCV(estimator=best_ens, method="isotonic", cv="prefit")
+calibrated.fit(X_val, y_val)
+
+# ==== 9. Threshold Selection Helpers ====
+def best_threshold_for_precision(y_true, proba, min_recall=None):
+    ths = np.linspace(0.01, 0.99, 99)
+    best = {"t": 0.5, "precision": -1, "recall": 0}
+    for t in ths:
+        y_pred = (proba >= t).astype(int)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        if min_recall is not None and rec < min_recall:
+            continue
+        if prec > best["precision"]:
+            best = {"t": t, "precision": prec, "recall": rec}
+    return best
+
+# ==== 10. Evaluate on Test Set ====
+proba_test = calibrated.predict_proba(X_test)[:,1]
+
+# Option A: maximize precision regardless of recall
+best_no_constraint = best_threshold_for_precision(y_test, proba_test, min_recall=None)
+print("Max precision threshold:", best_no_constraint)
+
+# Option B: enforce minimum recall (e.g., 0.7)
+best_with_constraint = best_threshold_for_precision(y_test, proba_test, min_recall=0.7)
+print("Best precision with recall>=0.7 threshold:", best_with_constraint)
+
+# ==== 11. Final Metrics & Confusion Matrix ====
+def eval_at_threshold(y_true, proba, t):
+    y_pred = (proba >= t).astype(int)
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "roc_auc": roc_auc_score(y_true, proba),
+        "pr_auc": average_precision_score(y_true, proba),
+        "threshold": t
+    }
+
+chosen = best_with_constraint if best_with_constraint["precision"] >= 0 else best_no_constraint
+metrics = eval_at_threshold(y_test, proba_test, chosen["t"])
+print("Selected threshold and metrics:")
+print(metrics)
+print("\nClassification report:")
+print(classification_report(y_test, (proba_test >= chosen["t"]).astype(int), digits=3))
+
+cm = confusion_matrix(y_test, (proba_test >= chosen["t"]).astype(int))
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+plt.xlabel("Predicted label")
+plt.ylabel("True label")
+plt.title("Confusion matrix (Test set)")
+plt.tight_layout()
+plt.show()
